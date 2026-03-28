@@ -149,6 +149,85 @@ class Retrieval(object):
         
         return self.cache[cache_key]
 
+    def load_cache(self):
+        """
+        从磁盘加载检索和嵌入的缓存。
+        """
+        if os.path.exists(self.cache_path):
+            with open(self.cache_path, "r") as f:
+                self.cache = json.load(f)
+        else:
+            self.cache = {}
+        if os.path.exists(self.embed_cache_path):
+            with open(self.embed_cache_path, "rb") as f:
+                self.embed_cache = pkl.load(f)
+        else:
+            self.embed_cache = {}
+    
+    def save_cache(self):
+        """
+        保存缓存到磁盘，采用合并模式防止多进程冲突。
+        """
+        if self.add_n > 0:
+            if os.path.exists(self.cache_path):
+                with open(self.cache_path, "r") as f:
+                    new_cache = json.load(f)
+                self.cache.update(new_cache)
+            
+            with open(self.cache_path, "w") as f:
+                json.dump(self.cache, f)
+        
+        if self.add_n_embed > 0:
+            if os.path.exists(self.embed_cache_path):
+                with open(self.embed_cache_path, "rb") as f:
+                    new_cache = pkl.load(f)
+                self.embed_cache.update(new_cache)
+            
+            with open(self.embed_cache_path, "wb") as f:
+                pkl.dump(self.embed_cache, f)
+
+    def get_bm25_passages(self, topic, query, passages, k):
+        """
+        在给定的段落集合中执行 BM25 检索。
+        """
+        if topic in self.embed_cache:
+            bm25 = self.embed_cache[topic]
+        else:
+            # 如果缓存中没有该主题的 BM25 索引，则即时创建
+            bm25 = BM25Okapi([psg["text"].replace("<s>", "").replace("</s>", "").split() for psg in passages])
+            self.embed_cache[topic] = bm25
+            self.add_n_embed += 1
+        
+        # 计算 BM25 得分并返回前 k 个段落
+        scores = bm25.get_scores(query.split())
+        indices = np.argsort(-scores)[:k]
+        return [passages[i] for i in indices]
+
+    def get_gtr_passages(self, topic, retrieval_query, passages, k):
+        """
+        使用 GTR 嵌入模型执行向量相似度检索。
+        """
+        if self.encoder is None:
+            self.load_encoder()
+        
+        if topic in self.embed_cache:
+            passage_vectors = self.embed_cache[topic]
+        else:
+            # 对所有段落进行编码并存入缓存
+            inputs = [psg["title"] + " " + psg["text"].replace("<s>", "").replace("</s>", "") for psg in passages]
+            passage_vectors = self.encoder.encode(inputs, batch_size=self.batch_size, device=self.encoder.device)
+            self.embed_cache[topic] = passage_vectors
+            self.add_n_embed += 1
+            
+        # 编码查询语句并计算与段落向量的内积
+        query_vectors = self.encoder.encode([retrieval_query], 
+                                            batch_size=self.batch_size,
+                                            device=self.encoder.device)[0]
+        scores = np.inner(query_vectors, passage_vectors)
+        indices = np.argsort(-scores)[:k]
+        return [passages[i] for i in indices]
+
+
 
         
         

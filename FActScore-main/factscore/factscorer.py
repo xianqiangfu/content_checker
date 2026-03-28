@@ -306,62 +306,75 @@ class FactScorer(object):
 
 
 if __name__ == '__main__':
-
+    # 命令行参数解析
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_path',
                         type=str,
-                        default="data/labeled/InstructGPT.jsonl")
+                        default="data/labeled/InstructGPT.jsonl",
+                        help="包含待评估数据（主题和生成文本）的 JSONL 文件路径")
     parser.add_argument('--model_name',
                         type=str,
-                        default="retrieval+ChatGPT")
+                        default="retrieval+ChatGPT",
+                        help="评估使用的模型组合")
     parser.add_argument('--gamma',
                         type=int,
                         default=10,
-                        help="hyperparameter for length penalty")
+                        help="长度惩罚超参数。如果原子事实数量少于 gamma，则会受到惩罚")
 
     parser.add_argument('--openai_key',
                         type=str,
-                        default="api.key")
+                        default="api.key",
+                        help="包含 OpenAI API Key 的文件路径")
     parser.add_argument('--data_dir',
                         type=str,
-                        default=".cache/factscore/")
+                        default=".cache/factscore/",
+                        help="数据缓存目录")
     parser.add_argument('--model_dir',
                         type=str,
-                        default=".cache/factscore/")
+                        default=".cache/factscore/",
+                        help="本地模型缓存目录")
     parser.add_argument('--cache_dir',
                         type=str,
-                        default=".cache/factscore/")
+                        default=".cache/factscore/",
+                        help="通用缓存目录")
     parser.add_argument('--knowledge_source',
                         type=str,
-                        default=None)
+                        default=None,
+                        help="知识源名称（例如维基百科数据库名）")
 
 
     parser.add_argument('--cost_estimate',
                         type=str,
                         default="consider_cache",
-                        choices=["consider_cache", "ignore_cache"])
+                        choices=["consider_cache", "ignore_cache"],
+                        help="成本估算模式")
     parser.add_argument('--abstain_detection_type',
                         type=str,
                         default=None,
-                        choices=["perplexity_ai", "generic", "none"])
+                        choices=["perplexity_ai", "generic", "none"],
+                        help="弃权检测类型")
     parser.add_argument('--use_atomic_facts',
-                        action="store_true")
+                        action="store_true",
+                        help="如果输入文件中已包含原子事实，则直接使用")
     parser.add_argument('--verbose',
                         action="store_true",
-                        help="for printing out the progress bar")    
+                        help="是否打印进度条")    
     parser.add_argument('--print_rate_limit_error',
                         action="store_true",
-                        help="for printing out rate limit error when using OpenAI keys")
+                        help="是否打印 OpenAI 频率限制错误")
     parser.add_argument('--n_samples',
                         type=int,
-                        default=None)
+                        default=None,
+                        help="仅评估前 N 个样本")
 
     args = parser.parse_args()
 
+    # 配置日志
     logging.basicConfig(format='%(asctime)s - %(name)s - %(message)s',
                         datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.ERROR if args.print_rate_limit_error else logging.CRITICAL)
 
+    # 初始化评估器
     fs = FactScorer(model_name=args.model_name,
                     data_dir=args.data_dir,
                     model_dir=args.model_dir,
@@ -370,6 +383,7 @@ if __name__ == '__main__':
                     cost_estimate=args.cost_estimate,
                     abstain_detection_type=args.abstain_detection_type)
 
+    # 读取输入数据
     tot = 0
     topics, generations, atomic_facts = [], [], []
     with open(args.input_path) as f:
@@ -377,30 +391,37 @@ if __name__ == '__main__':
             dp = json.loads(line)
             tot += 1
             if args.use_atomic_facts:
-                assert "annotations" in dp, "You can specify `--use_atomic_facts` only when atomic facts are available in the input data already."
+                # 如果指定使用现有原子事实，从数据中提取
+                assert "annotations" in dp, "只有在输入数据包含 annotations 时才能使用 --use_atomic_facts"
                 if dp["annotations"] is None:
                     continue
                 topics.append(dp["topic"])
                 generations.append(dp["output"])
                 atomic_facts.append([atom["text"] for sent in dp["annotations"] for atom in sent["model-atomic-facts"]])
             else:
+                # 仅读取主题和生成文本，后续会动态生成原子事实
                 topics.append(dp["topic"])
                 generations.append(dp["output"])
             if args.n_samples is not None and tot==args.n_samples:
                 break
+
+    # 运行评估流程并获取分数
     out = fs.get_score(topics=topics,
                        generations=generations,
                        gamma=args.gamma,
                        atomic_facts=atomic_facts if args.use_atomic_facts else None,
                        knowledge_source=args.knowledge_source,
                        verbose=args.verbose)
+
+    # 打印最终统计结果
     logging.critical("FActScore = %.1f%%" % (100*out["score"]))
     if "init_score" in out:
         logging.critical("FActScore w/o length penalty = %.1f%%" % (100*out["init_score"]))
     logging.critical("Respond ratio = %.1f%%" % (100*out["respond_ratio"]))
     logging.critical("# Atomic facts per valid response = %.1f" % (out["num_facts_per_response"]))
 
-    # Save out as a json file
+    # 将结果保存为 JSON 文件
     with open(args.input_path.replace(".jsonl", f"_factscore_output.json"), 'w') as f:
         f.write(json.dumps(out) + "\n")
+
 

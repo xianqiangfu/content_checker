@@ -33,20 +33,51 @@ class HallucinationChecker:
         return [s.strip() for s in sentences if s.strip()]
 
     def generate_atomic_facts(self, sentence: str) -> List[str]:
-        """2. 对每一句话，生成一个或几个原子 fact"""
-        prompt = f"""请将以下句子拆解为若干个独立的原子事实 (Atomic Facts)。
-每个事实应该是一个简单的陈述句。
-请按行输出，每行以 '-' 开头。
+        """
+        2. 对每一句话，生成一个或几个原子 fact (优化后的 Few-shot 逻辑)
+        参考 FActScore 的实现，使用 Few-shot 提示词来提高拆解的准确性。
+        """
+        # 定义 Few-shot 示例
+        demos = """请将以下句子拆解为若干个独立的原子事实 (Atomic Facts)。
+每个事实应该是一个简单的陈述句，包含一个独立的信息点。
 
-句子: {sentence}
+示例 1:
+句子: "张三是一名出生于 1990 年的软件工程师，目前在阿里巴巴工作。"
+原子事实:
+- 张三是一名软件工程师。
+- 张三出生于 1990 年。
+- 张三目前在阿里巴巴工作。
 
+示例 2:
+句子: "他不仅擅长 Python 开发，还精通 Java，并且是项目的负责人。"
+原子事实:
+- 他擅长 Python 开发。
+- 他精通 Java。
+- 他是项目的负责人。
+
+待处理句子: "{sentence}"
 原子事实:"""
+        
+        prompt = demos.format(sentence=sentence)
         response = self.llm.invoke(prompt)
-        facts = [line.strip("- ").strip() for line in response.content.split('\n') if line.strip().startswith("-")]
-        # 兜底：如果模型没按格式输出，则直接返回原句
+        
+        # 解析输出
+        facts = []
+        for line in response.content.split('\n'):
+            line = line.strip()
+            if line.startswith("-"):
+                fact = line.strip("- ").strip()
+                if fact:
+                    facts.append(fact)
+        
+        # 兜底逻辑：如果模型没有按格式输出，尝试进行简单的清洗或直接返回原句
         if not facts:
-            facts = [sentence]
+            # 尝试按行分割
+            lines = [l.strip() for l in response.content.split('\n') if len(l.strip()) > 5 and ":" not in l]
+            facts = lines if lines else [sentence]
+            
         return facts
+
 
     def retrieve_context(self, sentence: str) -> str:
         """3. 将这句话在 rag 中查找相关片段"""
