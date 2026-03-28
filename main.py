@@ -32,49 +32,83 @@ class HallucinationChecker:
         sentences = nltk.sent_tokenize(text)
         return [s.strip() for s in sentences if s.strip()]
 
+    def _clean_atomic_fact(self, fact: str) -> str:
+        """清洗提取出的原子事实，确保其是一个简洁、完整的陈述句"""
+        fact = fact.strip("- ").strip()
+        if not fact:
+            return ""
+        # 确保以句号结尾
+        if not fact.endswith(("。", ".", "！", "!", "？", "?")):
+            fact += "。"
+        return fact
+
     def generate_atomic_facts(self, sentence: str) -> List[str]:
         """
         2. 对每一句话，生成一个或几个原子 fact (优化后的 Few-shot 逻辑)
-        参考 FActScore 的实现，使用 Few-shot 提示词来提高拆解的准确性。
+        参考 FActScore (atomic_facts.py) 的核心逻辑：
+        - 使用更广泛的 Few-shot 示例来引导模型进行信息拆解
+        - 强调原子事实的独立性、简洁性和完整性
+        - 添加后处理清洗逻辑
         """
-        # 定义 Few-shot 示例
-        demos = """请将以下句子拆解为若干个独立的原子事实 (Atomic Facts)。
-每个事实应该是一个简单的陈述句，包含一个独立的信息点。
-
-示例 1:
-句子: "张三是一名出生于 1990 年的软件工程师，目前在阿里巴巴工作。"
-原子事实:
-- 张三是一名软件工程师。
-- 张三出生于 1990 年。
-- 张三目前在阿里巴巴工作。
-
-示例 2:
-句子: "他不仅擅长 Python 开发，还精通 Java，并且是项目的负责人。"
-原子事实:
-- 他擅长 Python 开发。
-- 他精通 Java。
-- 他是项目的负责人。
-
-待处理句子: "{sentence}"
-原子事实:"""
+        system_prompt = "你是一个专业的文本分析助手，擅长将复杂的句子拆解为最基础的、独立的原子事实 (Atomic Facts)。"
         
-        prompt = demos.format(sentence=sentence)
-        response = self.llm.invoke(prompt)
+        # 定义 Few-shot 示例 (参考 FActScore 的 demons 逻辑)
+        demos = [
+            {
+                "sentence": "张三是一名出生于 1990 年的软件工程师，目前在阿里巴巴工作。",
+                "facts": [
+                    "张三是一名软件工程师。",
+                    "张三出生于 1990 年。",
+                    "张三目前在阿里巴巴工作。"
+                ]
+            },
+            {
+                "sentence": "李四不仅精通 Python，还获得过 2023 年的最佳开发者奖项。",
+                "facts": [
+                    "李四精通 Python。",
+                    "李四获得过最佳开发者奖项。",
+                    "该奖项是在 2023 年获得的。"
+                ]
+            },
+            {
+                "sentence": "该公司的总部位于北京，由王五在 2005 年创立。",
+                "facts": [
+                    "该公司的总部位于北京。",
+                    "该公司是由王五创立的。",
+                    "该公司创立于 2005 年。"
+                ]
+            }
+        ]
+
+        # 构建 Prompt
+        prompt_content = "请将以下待处理句子拆解为若干个独立的原子事实。每个事实必须是简单的陈述句，包含且仅包含一个独立的信息点。\n\n"
+        for i, demo in enumerate(demos):
+            prompt_content += f"示例 {i+1}:\n句子: \"{demo['sentence']}\"\n原子事实:\n"
+            for f in demo['facts']:
+                prompt_content += f"- {f}\n"
+            prompt_content += "\n"
+
+        prompt_content += f"待处理句子: \"{sentence}\"\n原子事实:"
         
-        # 解析输出
+        # 调用大模型 (使用 ChatOllama 的 invoke)
+        response = self.llm.invoke(f"{system_prompt}\n\n{prompt_content}")
+        
+        # 优化解析逻辑 (参考 atomic_facts.py 的 text_to_sentences 思想)
+        raw_lines = response.content.split('\n')
         facts = []
-        for line in response.content.split('\n'):
-            line = line.strip()
-            if line.startswith("-"):
-                fact = line.strip("- ").strip()
-                if fact:
-                    facts.append(fact)
+        for line in raw_lines:
+            cleaned = self._clean_atomic_fact(line)
+            if cleaned and (line.strip().startswith("-") or line.strip().startswith("•")):
+                facts.append(cleaned)
         
-        # 兜底逻辑：如果模型没有按格式输出，尝试进行简单的清洗或直接返回原句
+        # 兜底逻辑：如果模型没有按 "-" 格式输出，尝试提取所有非空行
         if not facts:
-            # 尝试按行分割
-            lines = [l.strip() for l in response.content.split('\n') if len(l.strip()) > 5 and ":" not in l]
-            facts = lines if lines else [sentence]
+            facts = [self._clean_atomic_fact(l) for l in raw_lines if len(l.strip()) > 5 and ":" not in l]
+            facts = [f for f in facts if f]
+
+        # 最终兜底：如果还是没提取出来，返回原句
+        if not facts:
+            facts = [self._clean_atomic_fact(sentence)]
             
         return facts
 
