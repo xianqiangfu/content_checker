@@ -59,12 +59,18 @@ class RAGSystem:
         )
         print("重排序检索器配置完成。")
 
-    def query(self, question: str, use_rerank: bool = False):
-        """查询：检索并生成回答"""
+    def get_context(self, question: str, use_rerank: bool = False) -> str:
+        """仅检索并返回相关的上下文内容（不生成回答）"""
         if not self.retriever:
             raise ValueError("请先构建向量库。")
 
         retriever = self.compression_retriever if use_rerank and hasattr(self, 'compression_retriever') else self.retriever
+        docs = retriever.invoke(question)
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    def query(self, question: str, use_rerank: bool = False):
+        """查询：检索并生成回答"""
+        context = self.get_context(question, use_rerank)
         
         # 定义提示词模板
         template = """你是一个专业的助手。请根据以下提供的上下文回答问题。
@@ -79,16 +85,8 @@ class RAGSystem:
         prompt = ChatPromptTemplate.from_template(template)
 
         # 构建 RAG 链
-        def format_docs(docs):
-            return "\n\n".join(doc.page_content for doc in docs)
-
-        rag_chain = (
-            {"context": retriever | format_docs, "question": RunnablePassthrough()}
-            | prompt
-            | self.llm
-        )
-
-        response = rag_chain.invoke(question)
+        rag_chain = prompt | self.llm
+        response = rag_chain.invoke({"context": context, "question": question})
         return response.content
 
 if __name__ == "__main__":

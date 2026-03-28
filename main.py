@@ -69,19 +69,11 @@ class HallucinationChecker:
                     "李四获得过最佳开发者奖项。",
                     "该奖项是在 2023 年获得的。"
                 ]
-            },
-            {
-                "sentence": "该公司的总部位于北京，由王五在 2005 年创立。",
-                "facts": [
-                    "该公司的总部位于北京。",
-                    "该公司是由王五创立的。",
-                    "该公司创立于 2005 年。"
-                ]
             }
         ]
 
         # 构建 Prompt
-        prompt_content = "请将以下待处理句子拆解为若干个独立的原子事实。每个事实必须是简单的陈述句，包含且仅包含一个独立的信息点。\n\n"
+        prompt_content = "请将以下待处理句子拆解为若干个独立的原子事实。每个事实必须是简单的陈述句，包含且仅包含一个独立的信息点。请直接以列表形式输出，每行一个，以 '-' 开头。\n\n"
         for i, demo in enumerate(demos):
             prompt_content += f"示例 {i+1}:\n句子: \"{demo['sentence']}\"\n原子事实:\n"
             for f in demo['facts']:
@@ -93,19 +85,26 @@ class HallucinationChecker:
         # 调用大模型 (使用 ChatOllama 的 invoke)
         response = self.llm.invoke(f"{system_prompt}\n\n{prompt_content}")
         
-        # 优化解析逻辑 (参考 atomic_facts.py 的 text_to_sentences 思想)
-        raw_lines = response.content.split('\n')
-        facts = []
-        for line in raw_lines:
-            cleaned = self._clean_atomic_fact(line)
-            if cleaned and (line.strip().startswith("-") or line.strip().startswith("•")):
-                facts.append(cleaned)
+        # 优化解析逻辑：使用正则提取以 - 或 • 或 1. 开头的行
+        import re
+        raw_content = response.content
         
-        # 兜底逻辑：如果模型没有按 "-" 格式输出，尝试提取所有非空行
-        if not facts:
-            facts = [self._clean_atomic_fact(l) for l in raw_lines if len(l.strip()) > 5 and ":" not in l]
-            facts = [f for f in facts if f]
-
+        facts = []
+        for line in raw_content.split('\n'):
+            line = line.strip()
+            # 匹配常见的列表符号
+            match = re.match(r'^[-*•\d+\.]\s*(.*)', line)
+            if match:
+                fact_text = match.group(1).strip()
+                cleaned = self._clean_atomic_fact(fact_text)
+                if cleaned:
+                    facts.append(cleaned)
+            elif line and not any(line.startswith(s) for s in ["示例", "句子", "原子事实", "待处理"]):
+                # 兜底：如果是普通非空行且不是 Prompt 中的关键词，也尝试清洗
+                cleaned = self._clean_atomic_fact(line)
+                if cleaned and len(cleaned) > 5:
+                    facts.append(cleaned)
+        
         # 最终兜底：如果还是没提取出来，返回原句
         if not facts:
             facts = [self._clean_atomic_fact(sentence)]
@@ -115,58 +114,68 @@ class HallucinationChecker:
 
     def retrieve_context(self, sentence: str) -> str:
         """3. 将这句话在 rag 中查找相关片段"""
-        # 使用 RAG 系统的检索器获取相关文档
-        if self.rag.retriever:
-            docs = self.rag.retriever.invoke(sentence)
-            return "\n\n".join(doc.page_content for doc in docs)
+        # 尝试使用带重排序的检索器获取相关文档
+        try:
+            # 默认尝试使用 rerank (LLMChainExtractor)
+            return self.rag.get_context(sentence, use_rerank=True)
+        except Exception:
+            # 降级到普通检索
+            if self.rag.retriever:
+                docs = self.rag.retriever.invoke(sentence)
+                return "\n\n".join(doc.page_content for doc in docs)
         return ""
 
     def judge_hallucination(self, sentence: str, facts: List[str], context: str) -> str:
         """4. 将第二步、第三步的结果送入大模型进行判断"""
-        facts_str = "\n".join([f"- {f}" for f in facts])
+        facts_str = "\n".join([f"{i+1}. {f}" for i, f in enumerate(facts)])
         
-        prompt = f"""请根据提供的上下文 (Context)，判断以下原子事实 (Atomic Facts) 是否包含幻觉。
+        prompt = f"""请扮演一个严格的事实核查员。根据提供的上下文 (Context)，对给出的原子事实 (Atomic Facts) 进行逐条核实。
 
-上下文:
+[上下文]
 {context}
 
-原子事实:
+[待核实的原子事实]
 {facts_str}
 
-对于每一个原子事实，请按照以下标准进行判断：
-1. 有幻觉，生成内容不正确；
-2. 不确定；
-3. 无幻觉，生成内容正确。
+[核实要求]
+1. 请对每个事实给出判断：【正确】、【错误】或【不确定】。
+2. 简要说明理由，特别是对于【错误】或【不确定】的事实，请指出上下文中的矛盾点或缺失点。
+3. 如果上下文完全没有提及相关信息，请标记为【不确定】。
 
-最后给出该句子的综合评估。
+请以 Markdown 表格形式输出核实结果，表格列为：序号 | 原子事实 | 判定结果 | 理由说明
 
-判断结果:"""
+核实结果:"""
         response = self.llm.invoke(prompt)
         return response.content
 
     def check_answer(self, answer: str):
         """运行完整流程"""
-        print(f"--- 开始幻觉检测 ---")
+        print(f"\n{'='*20} 开始幻觉检测 {'='*20}")
         print(f"原始回答: {answer}\n")
         
         # 1. 分句
         sentences = self.split_into_sentences(answer)
+        print(f"共识别到 {len(sentences)} 个句子。\n")
         
         for i, sentence in enumerate(sentences):
-            print(f"[{i+1}] 处理句子: {sentence}")
+            print(f"[{i+1}/{len(sentences)}] 处理句子: \"{sentence}\"")
             
             # 2. 生成原子事实
             facts = self.generate_atomic_facts(sentence)
-            print(f"   - 提取的原子事实: {facts}")
+            print(f"   > 提取原子事实 ({len(facts)}个):")
+            for f in facts:
+                print(f"     - {f}")
             
             # 3. 检索 RAG 片段
             context = self.retrieve_context(sentence)
-            print(f"   - 检索到的上下文 (前 100 字): {context[:100]}...")
+            # print(f"   > 检索到的上下文 (前 100 字): {context[:100].replace('\\n', ' ')}...")
             
             # 4. 幻觉判断
             judgment = self.judge_hallucination(sentence, facts, context)
-            print(f"   - 判定结果:\n{judgment}\n")
-            print("-" * 50)
+            print(f"\n   > 判定结果:\n{judgment}\n")
+            print("-" * 60)
+        
+        print(f"{'='*20} 检测结束 {'='*20}\n")
 
 if __name__ == "__main__":
     # 示例运行
