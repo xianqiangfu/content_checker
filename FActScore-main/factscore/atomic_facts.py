@@ -18,17 +18,27 @@ nltk.download("punkt")
 
 
 class AtomicFactGenerator(object):
+    """
+    原子事实生成器，负责将长文本分解为独立的原子事实。
+    """
     def __init__(self, key_path, demon_dir, gpt3_cache_file=None):
+        """
+        初始化生成器。
+        :param key_path: OpenAI API Key 的路径。
+        :param demon_dir: 包含示例 (Demos) 的目录。
+        :param gpt3_cache_file: GPT-3 调用的缓存文件。
+        """
         self.nlp = spacy.load("en_core_web_sm")
         self.is_bio = True
         self.demon_path = os.path.join(demon_dir, "demons.json" if self.is_bio else "demons_complex.json")
 
         self.openai_lm = OpenAIModel("InstructGPT", cache_file=gpt3_cache_file, key_path=key_path)
 
-        # get the demos
+        # 加载示例数据 (Demos)，用于 Few-shot Prompt
         with open(self.demon_path, 'r') as f:
             self.demons = json.load(f)
 
+        # 使用 BM25 来检索与当前句子最相似的示例
         tokenized_corpus = [doc.split(" ") for doc in self.demons.keys()]
         self.bm25 = BM25Okapi(tokenized_corpus)
 
@@ -36,12 +46,18 @@ class AtomicFactGenerator(object):
         self.openai_lm.save_cache()
 
     def run(self, generation, cost_estimate=None):
-        """Convert the generation into a set of atomic facts. Return a total words cost if cost_estimate != None."""
+        """
+        将生成的内容转换为一组原子事实。
+        :param generation: 待处理的文本字符串。
+        :param cost_estimate: 如果不为 None，则返回成本估算。
+        :return: (原子事实对列表, 段落分隔符索引)
+        """
         assert isinstance(generation, str), "generation must be a string"
         paragraphs = [para.strip() for para in generation.split("\n") if len(para.strip()) > 0]
         return self.get_atomic_facts_from_paragraph(paragraphs, cost_estimate=cost_estimate)
 
     def get_atomic_facts_from_paragraph(self, paragraphs, cost_estimate=None):
+        """从段落中提取原子事实。"""
         sentences = []
         para_breaks = []
         for para_idx, paragraph in enumerate(paragraphs):
@@ -50,17 +66,19 @@ class AtomicFactGenerator(object):
 
             initials = detect_initials(paragraph)
 
+            # 使用 NLTK 进行分句
             curr_sentences = sent_tokenize(paragraph)
             curr_sentences_2 = sent_tokenize(paragraph)
 
+            # 修复分句器在处理缩写（如 A.B.）时的错误
             curr_sentences = fix_sentence_splitter(curr_sentences, initials)
             curr_sentences_2 = fix_sentence_splitter(curr_sentences_2, initials)
 
-            # checking this, just to ensure the crediability of the sentence splitter fixing algorithm
             assert curr_sentences == curr_sentences_2, (paragraph, curr_sentences, curr_sentences_2)
 
             sentences += curr_sentences
 
+        # 核心逻辑：调用 LLM 获取初始原子事实
         atoms_or_estimate = self.get_init_atomic_facts_from_sentence([sent for i, sent in enumerate(sentences) if not (not self.is_bio and ( \
                             (i==0 and (sent.startswith("Sure") or sent.startswith("Here are"))) or \
                             (i==len(sentences)-1 and (sent.startswith("Please") or sent.startswith("I hope") or sent.startswith("Here are")))))], cost_estimate=cost_estimate)
@@ -72,6 +90,7 @@ class AtomicFactGenerator(object):
 
         atomic_facts_pairs = []
         for i, sent in enumerate(sentences):
+            # 过滤掉一些常见的辅助性句子（如 "Sure", "Please" 等）
             if not self.is_bio and ( \
                 (i==0 and (sent.startswith("Sure") or sent.startswith("Here are"))) or \
                 (i==len(sentences)-1 and (sent.startswith("Please") or sent.startswith("I hope") or sent.startswith("Here are")))):
@@ -83,10 +102,7 @@ class AtomicFactGenerator(object):
             else:
                 atomic_facts_pairs.append((sent, atoms[sent]))
 
-        # postprocess_atomic_facts will fix minor issues from InstructGPT
-        # it is supposed to handle sentence splitter issue too, but since here
-        # we fixed sentence splitter issue already,
-        # the new para_breaks should be identical to the original para_breaks
+        # 后处理原子事实，修复一些 LLM 生成的小错误
         if self.is_bio:
             atomic_facts_pairs, para_breaks = postprocess_atomic_facts(atomic_facts_pairs, list(para_breaks), self.nlp)
 
@@ -94,7 +110,9 @@ class AtomicFactGenerator(object):
 
 
     def get_init_atomic_facts_from_sentence(self, sentences, cost_estimate=None):
-        """Get the initial atomic facts from the sentences. Return a total words cost if cost_estimate != None."""
+        """
+        通过调用 OpenAI 接口，从句子中提取初始原子事实。
+        """
 
         is_bio = self.is_bio
         demons = self.demons
@@ -108,9 +126,11 @@ class AtomicFactGenerator(object):
         for sentence in sentences:
             if sentence in atoms:
                 continue
+            # 1. 检索最相关的 Demos 
             top_machings = best_demos(sentence, self.bm25, list(demons.keys()), k)
             prompt = ""
 
+            # 2. 构建 Few-shot Prompt
             for i in range(n):
                 prompt = prompt + "Please breakdown the following sentence into independent facts: {}\n".format(list(demons.keys())[i])
                 for fact in demons[list(demons.keys())[i]]:
@@ -127,6 +147,7 @@ class AtomicFactGenerator(object):
             prompt_to_sent[prompt] = sentence
 
         if cost_estimate:
+            # 仅进行成本估算
             total_words_estimate = 0
             for prompt in prompts:
                 if cost_estimate == "consider_cache" and (prompt.strip() + "_0") in self.openai_lm.cache_dict:
@@ -134,6 +155,7 @@ class AtomicFactGenerator(object):
                 total_words_estimate += len(prompt.split())
             return total_words_estimate
         else:
+            # 实际调用 LLM 生成
             for prompt in prompts:
                 output, _ = self.openai_lm.generate(prompt)
                 atoms[prompt_to_sent[prompt]] = text_to_sentences(output)
@@ -143,6 +165,7 @@ class AtomicFactGenerator(object):
                     atoms[key] = value
 
             return atoms
+
 
 
 def best_demos(query, bm25, demons_sents, k):

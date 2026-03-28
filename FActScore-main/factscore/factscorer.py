@@ -14,6 +14,9 @@ from factscore.openai_lm import OpenAIModel
 from factscore.retrieval import DocDB, Retrieval
 
 class FactScorer(object):
+    """
+    FActScore 核心类，用于评估文本生成的原子事实准确性。
+    """
 
     def __init__(self,
                  model_name="retrieval+ChatGPT",
@@ -24,13 +27,24 @@ class FactScorer(object):
                  cost_estimate="consider_cache",
                  abstain_detection_type=None,
                  batch_size=256):
+        """
+        初始化 FactScorer。
+        :param model_name: 使用的模型组合，例如 "retrieval+ChatGPT", "retrieval+llama" 等。
+        :param data_dir: 数据存储目录。
+        :param model_dir: 模型存储目录。
+        :param cache_dir: 缓存目录。
+        :param openai_key: OpenAI API Key 的路径。
+        :param cost_estimate: 成本估算策略 ("consider_cache" 或 "ignore_cache")。
+        :param abstain_detection_type: 弃权检测类型。
+        :param batch_size: 检索时的批次大小。
+        """
         assert model_name in ["retrieval+llama", "retrieval+llama+npm", "retrieval+ChatGPT", "npm", "retrieval+ChatGPT+npm"]
         self.model_name = model_name
 
         self.db = {}
         self.retrieval = {}
         self.npm = {}
-        self.batch_size = batch_size # batch size for retrieval
+        self.batch_size = batch_size # 检索批次大小
         self.openai_key = openai_key
         self.abstain_detection_type = abstain_detection_type
 
@@ -42,6 +56,7 @@ class FactScorer(object):
         self.af_generator = None
         self.cost_estimate = cost_estimate
 
+        # 根据模型名称初始化相应的语言模型 (LM)
         if "llama" in model_name:
             self.lm = CLM("inst-llama-7B",
                           model_dir=os.path.join(model_dir, "inst-llama-7B"),
@@ -54,6 +69,7 @@ class FactScorer(object):
             self.lm = None
 
     def save_cache(self):
+        """保存所有模块的缓存。"""
         if self.lm:
             self.lm.save_cache()
         if "npm" in self.model_name:
@@ -63,6 +79,9 @@ class FactScorer(object):
             v.save_cache()
 
     def register_knowledge_source(self, name="enwiki-20230401", db_path=None, data_path=None):
+        """
+        注册知识源（通常是维基百科数据库）。
+        """
         assert name not in self.retrieval, f"{name} already registered"
         if db_path is None:
             db_path = os.path.join(self.data_dir, f"{name}.db")
@@ -84,13 +103,12 @@ class FactScorer(object):
 
 
     def print_cost_estimates(self, total_words, task, model):
+        """打印估算的 OpenAI API 成本。"""
         # https://help.openai.com/en/articles/4936856-what-are-tokens-and-how-to-count-them
-        # Number of tokens are roughly 4/3 of the number of words
+        # Token 数大约是单词数的 4/3
         total_tokens = total_words * 4.0 / 3
 
         # https://openai.com/pricing
-        # if we use davinci-003, the cost is $0.02 per 1000 tokens
-        # if we use gpt-3.5-turbo, the cost is $0.002 per 1000 tokens
         if model == "davinci-003":
             rate = 0.02
         elif model == "gpt-3.5-turbo":
@@ -98,7 +116,6 @@ class FactScorer(object):
 
         total_cost = total_tokens * rate / 1000
 
-        # print the total words, tokens, and cost along with rate
         logging.critical("Estimated OpenAI API cost for %s ($%.3f per 1000 tokens): $%.2f for %d words and %d tokens" % (task, rate, total_cost, total_words, total_tokens))
 
     def get_score(self,
@@ -108,8 +125,17 @@ class FactScorer(object):
                   atomic_facts=None,
                   knowledge_source=None,
                   verbose=False):
+        """
+        计算 FActScore。
+        :param topics: 主题列表。
+        :param generations: 生成的文本列表。
+        :param gamma: 长度惩罚超参数。
+        :param atomic_facts: 预先提取好的原子事实（可选）。
+        :param knowledge_source: 知识源名称。
+        :param verbose: 是否显示进度条。
+        :return: 包含分数和决策详情的字典。
+        """
         if knowledge_source is None:
-            # use the default knowledge source
             knowledge_source = "enwiki-20230401"
 
         if knowledge_source not in self.retrieval:
@@ -125,12 +151,13 @@ class FactScorer(object):
         if atomic_facts is not None:
             assert len(topics)==len(atomic_facts), "`topics` and `atomic_facts` should have the same length"
         else:
+            # 如果没有提供原子事实，则使用 AtomicFactGenerator 生成
             if self.af_generator is None:
                 self.af_generator = AtomicFactGenerator(key_path=self.openai_key,
                                                         demon_dir=os.path.join(self.data_dir, "demos"),
                                                         gpt3_cache_file=os.path.join(self.cache_dir, "InstructGPT.pkl"))
 
-            # estimate the total cost of atomic fact generation
+            # 估算原子事实生成的成本
             total_words = 0
             for gen in generations:
                 total_words += self.af_generator.run(gen, cost_estimate=self.cost_estimate)
@@ -142,12 +169,13 @@ class FactScorer(object):
 
             atomic_facts = []
             for topic, gen in zip(topics, generations):
-                # optionally, first detect if the response is abstained
+                # 检测响应是否包含弃权信息
                 response_abstained = is_response_abstained(gen, self.abstain_detection_type)
                 if response_abstained:
                     atomic_facts.append(None)
                     continue
-                # continue only when the response is not abstained
+                
+                # 生成原子事实
                 curr_afs, _ = self.af_generator.run(gen)
                 curr_afs = [fact for _, facts in curr_afs for fact in facts]
                 if len(curr_afs)==0:
@@ -163,7 +191,7 @@ class FactScorer(object):
         respond_ratio = np.mean([facts is not None for facts in atomic_facts])
 
         if "ChatGPT" in self.model_name:
-            # estimate the total cost of response generation
+            # 估算评估阶段的成本
             total_words = 0
             for topic, generation, facts in zip(topics, generations, atomic_facts):
                 if facts is not None:
@@ -177,14 +205,17 @@ class FactScorer(object):
         scores = []
         init_scores = []
         decisions = []
+        # 对每个生成的文本进行评分
         for topic, generation, facts in zip(topics, generations, atomic_facts):
             if facts is None:
                 decisions.append(None)
             else:
+                # 核心评分逻辑
                 decision = self._get_score(topic, generation, facts, knowledge_source)
                 score = np.mean([d["is_supported"] for d in decision])
                 
                 if gamma:
+                    # 应用长度惩罚
                     init_scores.append(score)
                     penalty = 1.0 if len(facts)>gamma else np.exp(1-gamma/len(facts))
                     score = penalty * score
@@ -207,12 +238,17 @@ class FactScorer(object):
         return out
 
     def _get_score(self, topic, generation, atomic_facts, knowledge_source, cost_estimate=None):
+        """
+        验证一组原子事实是否被知识源支持。
+        """
         decisions = []
         total_words = 0
         for atom in atomic_facts:
             atom = atom.strip()
             if self.lm:
+                # 1. 检索相关段落
                 passages = self.retrieval[knowledge_source].get_passages(topic, atom, k=5)
+                # 2. 构建 Prompt
                 definition = "Answer the question about {} based on the given context.\n\n".format(topic)
                 context = ""
                 for psg_idx, psg in enumerate(reversed(passages)):
@@ -229,17 +265,18 @@ class FactScorer(object):
                         total_words += len(prompt.split())
                     continue
 
+                # 3. LLM 生成判断结果
                 output = self.lm.generate(prompt)
 
                 if type(output[1])==np.ndarray:
-                    # when logits are available
+                    # 如果有 Logits (通常是本地 Llama)
                     logits = np.array(output[1])
                     assert logits.shape[0] in [32000, 32001]
-                    true_score = logits[5852]
-                    false_score = logits[7700]
+                    true_score = logits[5852] # "True" 的 token id
+                    false_score = logits[7700] # "False" 的 token id
                     is_supported = true_score > false_score
                 else:
-                    # when logits are unavailable
+                    # 如果只有文本输出 (通常是 ChatGPT)
                     generated_answer = output[0].lower()
                     if "true" in generated_answer or "false" in generated_answer:
                         if "true" in generated_answer and "false" not in generated_answer:
@@ -249,11 +286,13 @@ class FactScorer(object):
                         else:
                             is_supported = generated_answer.index("true") > generated_answer.index("false")
                     else:
+                        # 兜底逻辑：检测否定词
                         is_supported = all([keyword not in generated_answer.lower().translate(str.maketrans("", "", string.punctuation)).split() for keyword in ["not", "cannot", "unknown", "information"]])
 
             else:
                 is_supported = True
 
+            # 4. 可选：使用 NPM 进一步验证
             if is_supported and "npm" in self.model_name:
                 npprob = self.npm[knowledge_source].get_probabilty(topic, atom)
                 is_supported = npprob > 0.3
@@ -264,6 +303,7 @@ class FactScorer(object):
             return total_words
         else:
             return decisions
+
 
 if __name__ == '__main__':
 
