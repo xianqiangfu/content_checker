@@ -59,13 +59,19 @@ class RAGSystem:
         )
         print("重排序检索器配置完成。")
 
-    def get_context(self, question: str, use_rerank: bool = False) -> str:
-        """仅检索并返回相关的上下文内容（不生成回答）"""
+    def retrieve(self, question: str, use_rerank: bool = False) -> List[Document]:
+        """仅检索并返回相关的文档列表（不生成回答）"""
         if not self.retriever:
             raise ValueError("请先构建向量库。")
 
-        retriever = self.compression_retriever if use_rerank and hasattr(self, 'compression_retriever') else self.retriever
-        docs = retriever.invoke(question)
+        retriever = (self.compression_retriever 
+                     if use_rerank and hasattr(self, 'compression_retriever') 
+                     else self.retriever)
+        return retriever.invoke(question)
+
+    def get_context(self, question: str, use_rerank: bool = False) -> str:
+        """检索并返回合并后的上下文内容字符串"""
+        docs = self.retrieve(question, use_rerank)
         return "\n\n".join(doc.page_content for doc in docs)
 
     def query(self, question: str, use_rerank: bool = False):
@@ -106,4 +112,13 @@ if __name__ == "__main__":
     
     q = "什么是 RAG？"
     print(f"问题: {q}")
+    
+    # 测试检索接口
+    print("\n--- 仅检索结果 ---")
+    retrieved_docs = rag.retrieve(q, use_rerank=True)
+    for i, doc in enumerate(retrieved_docs):
+        print(f"文档 {i+1}: {doc.page_content}")
+        
+    # 测试回答接口
+    print("\n--- 生成回答 ---")
     print(f"回答: {rag.query(q, use_rerank=True)}")
